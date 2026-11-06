@@ -13,6 +13,7 @@ import {
   LOCAL_API_KEY,
   MESSAGE_HEADER,
   MODEL_HEADER,
+  PLUGIN_VERSION,
   PROVIDER_ID,
   REQUEST_KIND_HEADER,
   SESSION_HEADER,
@@ -239,7 +240,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   const rpcLog = (await readFile(process.env.FAKE_ACP_RPC_LOG!, "utf8")).trim().split("\n").map(line => JSON.parse(line));
   const initialize = rpcLog.filter(rpc => rpc.method === "initialize");
   expect(initialize.length).toBeGreaterThan(0);
-  for (const rpc of initialize) expect(rpc.params).toEqual({ protocolVersion: 1, clientCapabilities: {} });
+  for (const rpc of initialize) expect(rpc.params).toEqual({ protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: PROVIDER_ID, title: "OpenCode Antigravity", version: PLUGIN_VERSION } });
 
   const titleEvent = { ...event, kind: "title", headers: {} };
   await modelRequest.callback(titleEvent);

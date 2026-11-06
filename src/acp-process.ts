@@ -14,7 +14,7 @@ import {
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 import { AgyAbortError, AgyError, AgyProcessError, AgyProtocolError, AgyTimeoutError } from "./errors.js";
-import { DEFAULT_MAX_STDERR_BYTES, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpEffort } from "./constants.js";
+import { DEFAULT_MAX_STDERR_BYTES, PROVIDER_ID, PLUGIN_VERSION, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpEffort } from "./constants.js";
 import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
 import { cliAuthenticationError, requireCliAuthentication } from "./auth-bridge.js";
 import { debug, info, warn } from "./log.js";
@@ -309,6 +309,7 @@ export class AcpWorker {
       const init = await this.withSignal(agent.request(methods.agent.initialize, {
         protocolVersion: 1,
         clientCapabilities: {},
+        clientInfo: { name: PROVIDER_ID, title: "OpenCode Antigravity", version: PLUGIN_VERSION },
       }), signal);
       this.initValue = init;
       await this.openSession(agent, signal);
