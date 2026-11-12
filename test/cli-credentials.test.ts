@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { readWindowsCliCredential, resolveCliRefreshToken } from "../src/cli-credentials.js";
+import { readLinuxCliCredential, readWindowsCliCredential, resolveCliRefreshToken } from "../src/cli-credentials.js";
 import { requireCliAuthentication } from "../src/auth-bridge.js";
 import { effectiveAuth } from "../src/effective-auth.js";
 import { discoveryTimeoutMs } from "../src/model-catalog.js";
@@ -59,6 +59,44 @@ test("Windows keyring resolver tracks account changes/signout and isolates custo
     expect(await resolveCliRefreshToken({ ...environment, GEMINI_HOME: join(root, "custom") }, options)).toBeUndefined();
     expect(await resolveCliRefreshToken({ HOME: join(root, "other"), GEMINI_HOME: environment.GEMINI_HOME }, options)).toBe("synthetic-file");
     expect(reads).toBe(before);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Linux Secret Service resolver tracks account changes and isolates custom homes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agy-linux-credential-"));
+  const environment = { HOME: root, GEMINI_HOME: join(root, ".gemini") };
+  let raw: string | undefined = fixture("synthetic-first");
+  let reads = 0;
+  const options = { platform: "linux" as const, nativeHome: root, readKeyring: async () => { reads++; return raw; } };
+  try {
+    expect(await resolveCliRefreshToken(environment, options)).toBe("synthetic-first");
+    raw = fixture("synthetic-second");
+    expect(await resolveCliRefreshToken(environment, options)).toBe("synthetic-second");
+    raw = undefined;
+    expect(await resolveCliRefreshToken(environment, options)).toBeUndefined();
+    const directory = join(root, ".gemini", "antigravity-cli");
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "antigravity-oauth-token"), fixture("synthetic-file"));
+    expect(await resolveCliRefreshToken(environment, options)).toBe("synthetic-file");
+    for (raw of ["not json", JSON.stringify({ auth_method: "gcp", token: { refresh_token: "wrong" } }), fixture("")]) {
+      expect(await resolveCliRefreshToken(environment, options)).toBeUndefined();
+    }
+    const before = reads;
+    expect(await resolveCliRefreshToken({ ...environment, GEMINI_HOME: join(root, "custom") }, options)).toBeUndefined();
+    expect(await resolveCliRefreshToken({ HOME: join(root, "other"), GEMINI_HOME: environment.GEMINI_HOME }, options)).toBe("synthetic-file");
+    expect(reads).toBe(before);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test.skipIf(process.platform !== "linux")("Linux Secret Service reader returns only the stored entry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agy-secret-tool-"));
+  const tool = join(root, "secret-tool");
+  await writeFile(tool, "#!/bin/sh\nprintf '%s' \"$SECRET_TOOL_OUTPUT\"\n");
+  await chmod(tool, 0o755);
+  try {
+    expect(await readLinuxCliCredential({}, { path: tool })).toBeUndefined();
+    expect(await readLinuxCliCredential({ SECRET_TOOL_OUTPUT: fixture("synthetic") }, { path: tool })).toBe(fixture("synthetic"));
+    expect(await readLinuxCliCredential({}, { path: join(root, "missing") })).toBeUndefined();
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

@@ -25,6 +25,43 @@ details. A custom HOME or GEMINI_HOME remains file-only. It never creates a
 CLI token file, starts login, enumerates credentials, or writes the keyring.
 Native CI uses synthetic credentials on a disposable GitHub runner only.
 
+# Linux Secret Service credential review
+
+Reviewed on Linux x64 on 2026-11-12 against the Antigravity CLI 1.3.5 running
+from `~/.gemini/antigravity-cli`. The CLI log reports
+`keyring.go:64] keyringAuth: loaded token` followed by
+`auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)`, so
+the CLI stores its consumer credential in the Secret Service, not in a file
+under `~/.gemini/antigravity-cli/`.
+
+The CLI uses zalando/go-keyring, whose Linux backend maps the generic target
+`service:user` onto the Secret Service attributes `service` and `username` and
+stores the secret verbatim in the `password` attribute. The official target is
+therefore service `gemini`, account `antigravity`, and the stored secret is the
+raw UTF-8 JSON envelope, not an encoded blob:
+
+```json
+{"token":{"access_token":"...","token_type":"Bearer","refresh_token":"...","expiry":"...","expires_in":3599},"auth_method":"consumer","id_token_email":"..."}
+```
+
+This adapter reads only that one target through `secret-tool lookup service
+gemini username antigravity`. The lookup never enumerates the collection, is
+bounded to 10 seconds and 16 KiB, and reports a locked, missing or absent
+entry exactly like no credential at all. A stored envelope that is malformed or
+that is not a consumer/oauth-personal login is not a file-fallback login: it
+ends the resolution instead of silently falling through to another credential.
+
+A custom HOME or GEMINI_HOME stays file-only, exactly as on Windows, so a
+relocated home never borrows the desktop session's login. The file fallback
+(`~/.gemini/antigravity-cli/antigravity-oauth-token`) remains the only source
+for platforms whose CLI has no reviewed native store, including macOS, where
+the keychain coordinates of the separate ACP server are documented below.
+
+Note that this entry belongs to the CLI. The standalone ACP server keeps its
+own consumer credential under account `antigravity-acp`, which was absent on
+the reviewed host, so the server there used its secure file
+`~/.gemini/antigravity-acp/acp_token.json`.
+
 # macOS ARM64 isolation review
 
 Downloaded the official ACP 1.3.0 Darwin ARM64 archive and independently

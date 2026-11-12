@@ -66,6 +66,41 @@ export async function readWindowsCliCredential(environment: NodeJS.ProcessEnv): 
   } catch { return undefined; }
 }
 
+/**
+ * Linux Secret Service (KDE Wallet / GNOME Keyring) coordinates of the CLI's
+ * consumer credential: zalando/go-keyring stores the generic target
+ * `service:user` as the Secret Service "password" attribute, so the stored
+ * secret is the raw UTF-8 JSON envelope. See docs/credential-review.md.
+ */
+export const LINUX_KEYRING_SERVICE = "gemini";
+export const LINUX_KEYRING_ACCOUNT = "antigravity";
+const SECRET_TOOL = "/usr/bin/secret-tool";
+
+/**
+ * Reads only the official Secret Service target through `secret-tool`. The
+ * lookup never enumerates the collection and never reports raw errors: a
+ * locked, missing or absent entry is indistinguishable from no credential.
+ */
+export async function readLinuxCliCredential(environment: NodeJS.ProcessEnv,
+  options: { path?: string } = {}): Promise<string | undefined> {
+  const executable = options.path ?? SECRET_TOOL;
+  try {
+    const { stdout } = await promisify(execFile)(executable,
+      ["lookup", "service", LINUX_KEYRING_SERVICE, "username", LINUX_KEYRING_ACCOUNT],
+      { env: environment, timeout: 10_000, maxBuffer: 16_384, encoding: "utf8" });
+    const value = stdout.trim();
+    return value ? value : undefined;
+  } catch { return undefined; }
+}
+
+/** The native credential store this platform's CLI actually writes to. */
+export async function readNativeCliCredential(environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform): Promise<string | undefined> {
+  if (platform === "win32") return readWindowsCliCredential(environment);
+  if (platform === "linux") return readLinuxCliCredential(environment);
+  return undefined;
+}
+
 function refreshToken(raw: string | undefined): string | undefined {
   try {
     const value: unknown = JSON.parse(raw || "");
@@ -79,13 +114,17 @@ function refreshToken(raw: string | undefined): string | undefined {
 
 /** Custom HOME/GEMINI_HOME must never borrow another home's OS login. */
 export async function resolveCliRefreshToken(environment: NodeJS.ProcessEnv = process.env,
-  options: { platform?: NodeJS.Platform; nativeHome?: string; readKeyring?: typeof readWindowsCliCredential } = {}): Promise<string | undefined> {
+  options: { platform?: NodeJS.Platform; nativeHome?: string; readKeyring?: typeof readNativeCliCredential } = {}): Promise<string | undefined> {
   const nativeHome = options.nativeHome ?? homedir();
   const home = geminiHome(environment);
   const defaultHome = resolve(home) === resolve(join(nativeHome, ".gemini")) &&
     (!environment.HOME?.trim() || resolve(environment.HOME.trim()) === resolve(nativeHome));
-  if ((options.platform ?? process.platform) === "win32" && defaultHome) {
-    const raw = await (options.readKeyring ?? readWindowsCliCredential)(environment);
+  const platform = options.platform ?? process.platform;
+  // The CLI stores its consumer credential in the native credential store of
+  // the platform it ships for: Credential Manager on Windows, the Secret
+  // Service on Linux. A custom HOME/GEMINI_HOME never borrows that login.
+  if ((platform === "win32" || platform === "linux") && defaultHome) {
+    const raw = await (options.readKeyring ?? ((env: NodeJS.ProcessEnv) => readNativeCliCredential(env, platform)))(environment);
     // An existing malformed/non-consumer credential is not a file-fallback login.
     if (raw !== undefined) return refreshToken(raw);
   }
