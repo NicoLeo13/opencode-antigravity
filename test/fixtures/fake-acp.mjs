@@ -180,6 +180,7 @@ async function handlePrompt(message) {
     if (stateFile) fs.writeFileSync(stateFile, JSON.stringify({ remembered }));
   }
   let response = "FAKE_OK\n";
+  if (text.includes("/usage")) response = `${fs.readFileSync(new URL("./usage-reply.md", import.meta.url), "utf8").trimEnd()}\n`;
   if (text.includes("what did you remember")) response = `${remembered || "NOT_REMEMBERED"}\n`;
   if (text.includes("FAKE_STREAM")) response = "FAKE_STREAM_OK\n";
   if (text.includes("FAKE_SLOW_STREAM")) response = "FAKE_SLOW_STREAM_OK\n";

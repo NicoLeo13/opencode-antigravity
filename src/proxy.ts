@@ -37,6 +37,7 @@ import {
   replay,
   type AnthropicUsage,
 } from "./translate.js";
+import { getQuotaSnapshot } from "./quota.js";
 
 export type AnthropicMessageRequest = {
   model?: unknown;
@@ -468,7 +469,7 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
 async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname.startsWith("/mcp/")) return handleHostMcp(request);
-  const protectedRoute = (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models" || url.pathname === "/v1/usage" || url.pathname === "/usage")) || (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages"));
+  const protectedRoute = (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models" || url.pathname === "/v1/usage" || url.pathname === "/usage" || url.pathname === "/v1/quota" || url.pathname === "/quota")) || (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages"));
   if (protectedRoute && !localAuthorizationIsValid(request)) return errorResponse(new AgyError("auth", "Invalid local proxy API key", { code: "agy_local_key" }));
   if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
     const ready = Boolean(runtime && runtime.catalog.source !== "empty");
@@ -480,6 +481,15 @@ async function handleRequest(request: Request): Promise<Response> {
     const sessionID = request.headers.get(SESSION_HEADER);
     if (!sessionID) return errorResponse(new AgyError("invalid_request", "Context usage requires a host session header"));
     return Response.json(await readContextSnapshot(sessionID));
+  }
+  if (request.method === "GET" && (url.pathname === "/v1/quota" || url.pathname === "/quota")) {
+    try {
+      const quota = await getQuotaSnapshot(request.signal);
+      return Response.json(quota);
+    } catch (error) {
+      logError("quota request failed", { kind: error instanceof AgyError ? error.kind : "internal" });
+      return errorResponse(error);
+    }
   }
   if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
     try { return await handleMessages(request, await readJson(request)); }
