@@ -9,9 +9,11 @@ export const DEFAULT_PROXY_PORT = 42123;
 
 export const DEFAULT_PRINT_TIMEOUT_MS = 5 * 60_000;
 export const DEFAULT_TURN_STALL_TIMEOUT_MS = 10 * 60_000;
-export const DEFAULT_IDLE_WORKER_TIMEOUT_MS = 15 * 60_000;
+export const DEFAULT_IDLE_WORKER_TIMEOUT_MS = 5 * 60_000;
+export const DEFAULT_SESSION_METADATA_TTL_MS = 60 * 60_000;
+export const DEFAULT_QUOTA_WORKER_IDLE_MS = 5 * 60_000;
 export const DEFAULT_MAX_QUEUE_PER_SESSION = 1;
-export const DEFAULT_MAX_SESSIONS = 128;
+export const DEFAULT_MAX_SESSIONS = 6;
 export const DEFAULT_MAX_STDERR_BYTES = 256 * 1024;
 // 32 MiB decoded images expand to ~43 MiB base64; leave bounded JSON/text room.
 export const DEFAULT_MAX_REQUEST_BYTES = 48 * 1024 * 1024;

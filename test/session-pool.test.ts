@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { useFixtureAuthentication } from "./fixtures/compatibility.js";
 useFixtureAuthentication();
+import { DEFAULT_IDLE_WORKER_TIMEOUT_MS, DEFAULT_MAX_SESSIONS } from "../src/constants.js";
 import { SessionPool } from "../src/session-pool.js";
 
 const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
@@ -63,5 +64,10 @@ describe("session pool isolation", () => {
     } finally {
       await secondPool.close();
     }
+  });
+
+  test("caps default pool sessions and idle timeout to bound memory", () => {
+    expect(DEFAULT_MAX_SESSIONS).toBeLessThanOrEqual(6);
+    expect(DEFAULT_IDLE_WORKER_TIMEOUT_MS).toBeLessThanOrEqual(5 * 60_000);
   });
 });

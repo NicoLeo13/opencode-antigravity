@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -154,6 +154,23 @@ describe("Antigravity tree ownership", () => {
     expect(await canConnect(info.port)).toBe(false);
   });
 
+  test("terminates the detached tree when the owner is killed with SIGKILL", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agy-tree-kill-"));
+    directories.push(directory);
+    const infoFile = join(directory, "tree.json");
+    const { owner } = await startOwner(infoFile);
+    owners.push(owner);
+
+    const info = await readTreeInfo(infoFile);
+    expect(isAlive(info.pid)).toBe(true);
+    expect(await canConnect(info.port)).toBe(true);
+
+    owner.kill("SIGKILL");
+
+    expect(await waitUntil(() => !isAlive(info.pid))).toBe(true);
+    expect(await canConnect(info.port)).toBe(false);
+  });
+
   test("terminates the detached tree when the owner exits normally", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agy-tree-exit-"));
     directories.push(directory);
@@ -195,4 +212,41 @@ describe("Antigravity tree ownership", () => {
     expect(await waitUntil(() => !isAlive(info.pid))).toBe(true);
     expect(await canConnect(info.port)).toBe(false);
   });
+
+  test("escalates worker.stop(false) to SIGKILL when a child ignores stdin EOF and SIGTERM", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agy-stop-escalate-"));
+    directories.push(directory);
+    const stub = join(directory, "stubborn-acp.mjs");
+    await writeFile(
+      stub,
+      `#!/usr/bin/env bun
+import readline from "node:readline";
+process.on("SIGTERM", () => {});
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } }) + "\\n");
+  } else if (msg.method === "session/new") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "stubborn-1" } }) + "\\n");
+  }
+});
+setInterval(() => {}, 60_000);
+`,
+    );
+    await chmod(stub, 0o755);
+    const { createAcpWorker } = await import("../src/acp-process.js");
+    const compatibility = (await import("./fixtures/compatibility.js")).fixtureCompatibility();
+    try {
+      const worker = await createAcpWorker({ cwd: directory, executable: stub, hostTools: false });
+      const pid = (worker as unknown as { child?: { pid?: number } }).child?.pid;
+      expect(pid).toBeGreaterThan(0);
+
+      await worker.stop(false);
+      expect(worker.state).toBe("closed");
+      expect(await waitUntil(() => !isAlive(pid!), 2_000)).toBe(true);
+    } finally {
+      compatibility.mockRestore();
+    }
+  }, 10_000);
 });

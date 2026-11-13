@@ -220,11 +220,48 @@ async function terminateProcess(child: ChildProcess, force = false): Promise<voi
 // terminates the whole group when the process itself is asked to stop.
 const OWNER_SIGNALS = ["SIGHUP", "SIGINT", "SIGTERM"] as const;
 type OwnerSignal = (typeof OWNER_SIGNALS)[number];
-const liveTrees = new Set<ChildProcess>();
+const liveTrees = new Map<ChildProcess, ChildProcess | null>();
 let ownerHandlers: {
   signals: Map<OwnerSignal, () => void>;
   exit: () => void;
 } | null = null;
+
+function stopWatchdog(watchdog: ChildProcess | null | undefined): void {
+  if (!watchdog) return;
+  try {
+    if (watchdog.pid && process.platform !== "win32") process.kill(-watchdog.pid, "SIGKILL");
+    else watchdog.kill("SIGKILL");
+  } catch { /* already gone */ }
+  try { watchdog.kill("SIGKILL"); } catch { /* already gone */ }
+  try { watchdog.stdin?.destroy(); } catch { /* already closed */ }
+}
+
+function spawnParentDeathWatchdog(child: ChildProcess): ChildProcess | null {
+  if (process.platform === "win32" || !child.pid) return null;
+  try {
+    // Blocks on stdin pipe EOF (fires immediately on SIGKILL/crash) and checks
+    // kill -0 on the owner PID before terminating the detached worker group.
+    const script = [
+      'parent="$1"; pgid="$2"',
+      'IFS= read -r _ <&0 2>/dev/null || true',
+      'while kill -0 "$parent" 2>/dev/null; do sleep 1; done',
+      'kill -TERM -"$pgid" 2>/dev/null || true',
+      'sleep 0.5 2>/dev/null || sleep 1',
+      'kill -KILL -"$pgid" 2>/dev/null || true',
+    ].join("; ");
+    const watchdog = spawn("/bin/sh", ["-c", script, "agy-watchdog", String(process.pid), String(child.pid)], {
+      detached: true,
+      stdio: ["pipe", "ignore", "ignore"],
+      windowsHide: true,
+    });
+    watchdog.on("error", () => { /* best-effort safety net */ });
+    watchdog.unref();
+    (watchdog.stdin as unknown as { unref?: () => void } | null)?.unref?.();
+    return watchdog;
+  } catch {
+    return null;
+  }
+}
 
 function terminateTreeGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   try {
@@ -248,9 +285,12 @@ function waitForTreeExit(milliseconds: number): void {
 
 function terminateLiveTrees(signal: OwnerSignal): void {
   if (liveTrees.size === 0) return;
-  for (const child of liveTrees) terminateTreeGroup(child, signal);
+  for (const [child, watchdog] of liveTrees) {
+    stopWatchdog(watchdog);
+    terminateTreeGroup(child, signal);
+  }
   waitForTreeExit(300);
-  for (const child of liveTrees) terminateTreeGroup(child, "SIGKILL");
+  for (const child of liveTrees.keys()) terminateTreeGroup(child, "SIGKILL");
   liveTrees.clear();
 }
 
@@ -283,7 +323,10 @@ function syncOwnerSignalHandlers(): void {
     process.on(signal, handler);
   }
   const exit = () => {
-    for (const child of liveTrees) terminateTreeGroup(child, "SIGKILL");
+    for (const [child, watchdog] of liveTrees) {
+      stopWatchdog(watchdog);
+      terminateTreeGroup(child, "SIGKILL");
+    }
     liveTrees.clear();
     removeOwnerSignalHandlers();
   };
@@ -342,11 +385,17 @@ export class AcpWorker {
   async start(signal?: AbortSignal): Promise<void> {
     if (this.stateValue === "ready") return;
     if (this.stateValue !== "created") throw new AgyProcessError(`Cannot start ACP worker from state ${this.stateValue}`);
+    if (signal?.aborted) {
+      this.stateValue = "failed";
+      throw new AgyAbortError();
+    }
     this.stateValue = "starting";
     try {
       const environment = { ...process.env, ...this.options.environment };
       const browser = await prepareBrowserBlocker(environment);
+      if (signal?.aborted) throw new AgyAbortError();
       const args = this.options.executableArgs ?? (await detectAcpServer(this.executable)).args;
+      if (signal?.aborted) throw new AgyAbortError();
       this.child = spawn(this.executable, args, {
         cwd: this.options.cwd,
         // ACP itself can launch OAuth from session/new or a failed refresh.
@@ -358,9 +407,13 @@ export class AcpWorker {
       });
       const child = this.child as ChildProcessWithoutNullStreams;
       const untrackTree = () => {
-        if (liveTrees.delete(child)) syncOwnerSignalHandlers();
+        const watchdog = liveTrees.get(child);
+        if (liveTrees.delete(child)) {
+          stopWatchdog(watchdog);
+          syncOwnerSignalHandlers();
+        }
       };
-      liveTrees.add(child);
+      liveTrees.set(child, spawnParentDeathWatchdog(child));
       syncOwnerSignalHandlers();
       child.once("exit", untrackTree);
       child.stderr.on("data", (chunk: Buffer | string) => {
@@ -634,23 +687,48 @@ export class AcpWorker {
           let timer: ReturnType<typeof setTimeout> | undefined;
           let closed = false;
           let terminating = false;
-          const finish = () => { if (timer) clearTimeout(timer); child.removeListener("close", onClose); resolveResult(); };
-          const onClose = () => { closed = true; if (!terminating) finish(); };
+          const finish = () => {
+            if (timer) clearTimeout(timer);
+            child.removeListener("close", onClose);
+            resolveResult();
+          };
+          const waitClosed = (ms: number, onTimeout: () => void) => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(onTimeout, ms);
+            timer.unref?.();
+          };
+          const sendKill = () => {
+            terminating = true;
+            void terminateProcess(child, true).then(() => {
+              terminating = false;
+              if (closed) finish();
+              else waitClosed(1_000, finish);
+            });
+          };
+          const onClose = () => {
+            closed = true;
+            if (!terminating) finish();
+          };
           child.once("close", onClose);
-          timer = setTimeout(() => {
+          waitClosed(force ? 500 : 3_000, () => {
             terminating = true;
             // taskkill must finish the entire Windows process tree before
             // callers remove the worker's directory or open a replacement.
             void terminateProcess(child, force).then(() => {
+              terminating = false;
               if (closed) finish();
-              else timer = setTimeout(finish, 1_000);
+              else if (force) waitClosed(1_000, finish);
+              else waitClosed(1_000, sendKill);
             });
-          }, force ? 500 : 3_000);
-          timer.unref?.();
+          });
         });
       }
-      if (child && (child.exitCode !== null || child.signalCode !== null) && liveTrees.delete(child)) {
-        syncOwnerSignalHandlers();
+      if (child && (child.exitCode !== null || child.signalCode !== null)) {
+        const watchdog = liveTrees.get(child);
+        if (liveTrees.delete(child)) {
+          stopWatchdog(watchdog);
+          syncOwnerSignalHandlers();
+        }
       }
       this.stateValue = "closed";
       debug("official Antigravity worker stopped", { force });
@@ -701,19 +779,24 @@ export class AcpWorker {
 }
 
 export async function createAcpWorker(options: AcpWorkerOptions, signal?: AbortSignal): Promise<AcpWorker> {
+  if (signal?.aborted) throw new AgyAbortError();
   // CLI consumer credentials are the sole authentication source. Legacy ACP
   // method overrides must not select another interactive login mechanism.
   const environment = { ...process.env, ...options.environment };
   await requireCliAuthentication(environment);
+  if (signal?.aborted) throw new AgyAbortError();
   const detection = options.executable
     ? { executable: options.executable, args: options.executableArgs }
     : await ensureAcpServer();
+  if (signal?.aborted) throw new AgyAbortError();
   if (options.hostTools) await assertHostToolCompatibility(detection.executable);
+  if (signal?.aborted) throw new AgyAbortError();
   if (options.hostTools) {
     const isolated = await hostEnvironment(environment,
       options.catalogScope, options.utilityDirectory);
     options = { ...options, ...isolated };
   }
+  if (signal?.aborted) throw new AgyAbortError();
   const worker = new AcpWorker({
     ...options,
     executableArgs: options.executableArgs ?? detection.args,

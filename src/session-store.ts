@@ -2,7 +2,7 @@ import { chmod, readFile, readdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { DEFAULT_IDLE_WORKER_TIMEOUT_MS } from "./constants.js";
+import { DEFAULT_SESSION_METADATA_TTL_MS } from "./constants.js";
 import { acquireFileLock } from "./file-lock.js";
 import { atomicWrite, sweepHistoricalDeletedTemps } from "./atomic-write.js";
 import { AgyBusyError, AgyError } from "./errors.js";
@@ -371,7 +371,7 @@ export class SessionStore {
     } finally { await unlock(); }
   }
 
-  async prune(maxIdleMs = DEFAULT_IDLE_WORKER_TIMEOUT_MS * 4, protectedKeys: ReadonlySet<string> = new Set()): Promise<void> {
+  async prune(maxIdleMs = DEFAULT_SESSION_METADATA_TTL_MS, protectedKeys: ReadonlySet<string> = new Set()): Promise<void> {
     await this.pruneCompletedPayloads();
     await this.pruneCompletedToolPayloads(Date.now(), protectedKeys);
     await pruneUtilityArtifacts(dataDirectory());

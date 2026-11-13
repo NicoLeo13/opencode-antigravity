@@ -1,9 +1,10 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAcpWorker, type AcpWorker } from "./acp-process.js";
+import { AcpWorker, createAcpWorker } from "./acp-process.js";
+import { DEFAULT_QUOTA_WORKER_IDLE_MS, envNumber } from "./constants.js";
 import { collectTurn } from "./translate.js";
-import { AgyError } from "./errors.js";
+import { AgyAbortError, AgyError } from "./errors.js";
 import { info, warn } from "./log.js";
 import { resolveQuotaRuntime } from "./quota-runtime.js";
 
@@ -96,11 +97,30 @@ export class QuotaManager {
   private inFlight: Promise<QuotaV1Response> | null = null;
   private worker: AcpWorker | undefined;
   private workerPromise: Promise<AcpWorker> | undefined;
+  private workerController: AbortController | undefined;
+  private workerGeneration = 0;
   private tempDir: string | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
+  private idleTimer: ReturnType<typeof setInterval> | undefined;
+  private lastRequestedAt: number | null = null;
+  private readonly workerIdleMs: number;
+  private readonly refreshIntervalMs: number | undefined;
+
+  constructor(options: { workerIdleMs?: number; refreshIntervalMs?: number } = {}) {
+    this.workerIdleMs = options.workerIdleMs ?? envNumber("OPENCODE_ANTIGRAVITY_QUOTA_IDLE_MS", DEFAULT_QUOTA_WORKER_IDLE_MS, 25);
+    this.refreshIntervalMs = options.refreshIntervalMs;
+  }
+
+  get hasActiveWorker(): boolean {
+    return Boolean(
+      (this.worker && this.worker.state !== "closed" && this.worker.state !== "failed") ||
+      this.workerPromise,
+    );
+  }
 
   async getQuota(options: { forceRefresh?: boolean; signal?: AbortSignal } = {}): Promise<QuotaV1Response> {
     const now = Date.now();
+    this.lastRequestedAt = now;
     const ttl = Number(process.env.OPENCODE_ANTIGRAVITY_QUOTA_TTL_MS) || DEFAULT_QUOTA_CACHE_TTL_MS;
     const maxStale = Number(process.env.OPENCODE_ANTIGRAVITY_QUOTA_MAX_STALE_MS) || DEFAULT_QUOTA_MAX_STALE_MS;
 
@@ -138,6 +158,7 @@ export class QuotaManager {
   }
 
   private async fetchLiveQuota(signal?: AbortSignal): Promise<QuotaV1Response> {
+    const generation = this.workerGeneration;
     const worker = await this.ensureWorker(signal);
     try {
       const turn = worker.runTurn([{ type: "text", text: "/usage" }], signal);
@@ -158,8 +179,8 @@ export class QuotaManager {
       info("Fetched fresh Antigravity quota", { count: parsed.entries.length });
       return parsed;
     } catch (error) {
-      // A worker that cannot answer is replaced on the next refresh.
-      await this.dropWorker();
+      // A worker that cannot answer is replaced on the next refresh, unless a newer generation took over.
+      await this.dropWorker(generation);
       if (error instanceof AgyError) throw error;
       throw new AgyError("process", "Failed to fetch Antigravity quota", { cause: error, code: "agy_quota_fetch_failed" });
     }
@@ -168,55 +189,113 @@ export class QuotaManager {
   /**
    * The worker that answers `/usage`.
    *
-   * One worker serves every refresh: spawning one per request costs the
-   * whole ACP startup, and the quota panel reads the endpoint far more often
-   * than the quota actually changes.
+   * One worker serves every refresh while the quota endpoint is actively read,
+   * and is released after inactivity so unused instances hold no ACP process.
    */
   private async ensureWorker(signal?: AbortSignal): Promise<AcpWorker> {
-    if (this.worker) return this.worker;
+    if (signal?.aborted) throw new AgyAbortError();
+    if (this.worker) {
+      if (this.worker.state !== "closed" && this.worker.state !== "failed") return this.worker;
+      await this.dropWorker(this.workerGeneration);
+    }
     if (!this.workerPromise) {
+      const generation = this.workerGeneration;
+      const controller = new AbortController();
+      this.workerController = controller;
+      const onAbort = () => controller.abort();
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.workerPromise = (async () => {
-        const runtime = await resolveQuotaRuntime();
-        if (!runtime) {
-          throw new AgyError("unsupported", "No official Antigravity runtime that answers /usage is installed", {
-            code: "agy_quota_runtime_missing",
-          });
+        let dir: string | undefined;
+        let createdWorker: AcpWorker | undefined;
+        try {
+          if (controller.signal.aborted || generation !== this.workerGeneration) throw new AgyAbortError();
+          const runtime = await resolveQuotaRuntime();
+          if (controller.signal.aborted || generation !== this.workerGeneration) throw new AgyAbortError();
+          if (!runtime) {
+            throw new AgyError("unsupported", "No official Antigravity runtime that answers /usage is installed", {
+              code: "agy_quota_runtime_missing",
+            });
+          }
+          dir = await mkdtemp(join(tmpdir(), "agy-quota-"));
+          if (controller.signal.aborted || generation !== this.workerGeneration) throw new AgyAbortError();
+          createdWorker = await createAcpWorker({ cwd: dir, executable: runtime, hostTools: false }, controller.signal);
+          if (controller.signal.aborted || generation !== this.workerGeneration) throw new AgyAbortError();
+          this.tempDir = dir;
+          this.worker = createdWorker;
+          this.startIdleWatch();
+          return createdWorker;
+        } catch (error) {
+          await createdWorker?.stop(true).catch(() => undefined);
+          if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+          throw error;
         }
-        this.tempDir = await mkdtemp(join(tmpdir(), "agy-quota-"));
-        const worker = await createAcpWorker({ cwd: this.tempDir, executable: runtime, hostTools: false }, signal);
-        this.worker = worker;
-        return worker;
-      })().finally(() => { this.workerPromise = undefined; });
+      })().finally(() => {
+        signal?.removeEventListener("abort", onAbort);
+        if (this.workerController === controller) this.workerController = undefined;
+        if (generation === this.workerGeneration || this.workerController === undefined) {
+          this.workerPromise = undefined;
+        }
+      });
     }
     return this.workerPromise;
   }
 
-  private async dropWorker(): Promise<void> {
+  private startIdleWatch(): void {
+    if (this.idleTimer) return;
+    const interval = Math.max(10, Math.min(this.workerIdleMs, 30_000));
+    this.idleTimer = setInterval(() => {
+      if (this.inFlight || this.workerPromise) return;
+      if (this.lastRequestedAt === null || Date.now() - this.lastRequestedAt >= this.workerIdleMs) {
+        void this.dropWorker();
+      }
+    }, interval);
+    this.idleTimer.unref?.();
+  }
+
+  private async dropWorker(expectedGeneration?: number): Promise<void> {
+    if (expectedGeneration !== undefined && expectedGeneration !== this.workerGeneration) return;
+    this.workerGeneration += 1;
+    if (this.idleTimer) { clearInterval(this.idleTimer); this.idleTimer = undefined; }
+    this.workerController?.abort();
+    this.workerController = undefined;
+    const pendingWorker = this.workerPromise;
+    this.workerPromise = undefined;
     const worker = this.worker;
     this.worker = undefined;
     const tempDir = this.tempDir;
     this.tempDir = undefined;
-    await worker?.stop(true).catch(() => undefined);
+    await Promise.all([
+      pendingWorker?.then(
+        (resolved) => resolved.stop(true).catch(() => undefined),
+        () => undefined,
+      ),
+      worker?.stop(true).catch(() => undefined),
+    ]);
     if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
   }
 
   /**
-   * Keeps the snapshot warm so the quota endpoint answers from the cache.
+   * Keeps the snapshot warm while clients actively poll `/quota`.
    *
-   * A live `/usage` takes seconds, far longer than the quota panel waits for
-   * a reply, so the endpoint never fetches on the request path once the
-   * cache holds a snapshot.
+   * Does not spawn an ACP process eagerly on startup; the worker starts on the
+   * first quota request and is dropped once requests stop arriving.
    */
   start(): void {
     if (this.timer) return;
-    const interval = Number(process.env.OPENCODE_ANTIGRAVITY_QUOTA_REFRESH_MS) || DEFAULT_QUOTA_REFRESH_INTERVAL_MS;
-    this.timer = setInterval(() => { void this.refresh().catch(() => undefined); }, interval);
+    const interval = this.refreshIntervalMs ?? (Number(process.env.OPENCODE_ANTIGRAVITY_QUOTA_REFRESH_MS) || DEFAULT_QUOTA_REFRESH_INTERVAL_MS);
+    this.timer = setInterval(() => {
+      if (this.lastRequestedAt === null || Date.now() - this.lastRequestedAt >= this.workerIdleMs) {
+        if (!this.inFlight && !this.workerPromise && this.worker) void this.dropWorker();
+        return;
+      }
+      void this.refresh().catch(() => undefined);
+    }, interval);
     this.timer.unref?.();
-    void this.refresh().catch(() => undefined);
   }
 
   async stop(): Promise<void> {
     if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+    this.lastRequestedAt = null;
     await this.dropWorker();
     this.clearCache();
   }
