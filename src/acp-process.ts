@@ -214,6 +214,83 @@ async function terminateProcess(child: ChildProcess, force = false): Promise<voi
   }
 }
 
+// The Antigravity tree is spawned detached, so it gets its own session and
+// survives the owner: a terminal that closes with SIGHUP never reaches the
+// child's process group. The owner therefore tracks every live tree and
+// terminates the whole group when the process itself is asked to stop.
+const OWNER_SIGNALS = ["SIGHUP", "SIGINT", "SIGTERM"] as const;
+type OwnerSignal = (typeof OWNER_SIGNALS)[number];
+const liveTrees = new Set<ChildProcess>();
+let ownerHandlers: {
+  signals: Map<OwnerSignal, () => void>;
+  exit: () => void;
+} | null = null;
+
+function terminateTreeGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  try {
+    if (child.pid && process.platform === "win32") {
+      // Windows has no process groups; the launcher is killed directly.
+      child.kill(signal);
+      return;
+    }
+    if (child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    // ESRCH means the tree is already gone.
+  }
+}
+
+function waitForTreeExit(milliseconds: number): void {
+  // The exit path is synchronous, so the grace window has to block the event
+  // loop instead of using a timer.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function terminateLiveTrees(signal: OwnerSignal): void {
+  if (liveTrees.size === 0) return;
+  for (const child of liveTrees) terminateTreeGroup(child, signal);
+  waitForTreeExit(300);
+  for (const child of liveTrees) terminateTreeGroup(child, "SIGKILL");
+  liveTrees.clear();
+}
+
+function removeOwnerSignalHandlers(): void {
+  if (!ownerHandlers) return;
+  const emitter = process as NodeJS.EventEmitter;
+  for (const [signal, handler] of ownerHandlers.signals) {
+    emitter.removeListener(signal, handler);
+  }
+  emitter.removeListener("exit", ownerHandlers.exit);
+  ownerHandlers = null;
+}
+
+function syncOwnerSignalHandlers(): void {
+  if (liveTrees.size === 0) {
+    removeOwnerSignalHandlers();
+    return;
+  }
+  if (ownerHandlers) return;
+  const signals = new Map<OwnerSignal, () => void>();
+  for (const signal of OWNER_SIGNALS) {
+    const handler = () => {
+      terminateLiveTrees(signal);
+      removeOwnerSignalHandlers();
+      // Hand the signal back to the default handler when no host handler
+      // remains so the process keeps the exit status of the signal it received.
+      if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+    };
+    signals.set(signal, handler);
+    process.on(signal, handler);
+  }
+  const exit = () => {
+    for (const child of liveTrees) terminateTreeGroup(child, "SIGKILL");
+    liveTrees.clear();
+    removeOwnerSignalHandlers();
+  };
+  process.on("exit", exit);
+  ownerHandlers = { signals, exit };
+}
+
 export class AcpWorker {
   readonly options: AcpWorkerOptions;
   readonly executable: string;
@@ -280,6 +357,12 @@ export class AcpWorker {
         windowsHide: true,
       });
       const child = this.child as ChildProcessWithoutNullStreams;
+      const untrackTree = () => {
+        if (liveTrees.delete(child)) syncOwnerSignalHandlers();
+      };
+      liveTrees.add(child);
+      syncOwnerSignalHandlers();
+      child.once("exit", untrackTree);
       child.stderr.on("data", (chunk: Buffer | string) => {
         const stderr = this.stderrTail + String(chunk);
         this.stderrTail = stderr.slice(-512);
@@ -293,6 +376,7 @@ export class AcpWorker {
         this.stderrDiagnostic += (typeof chunk === "string" ? chunk : chunk.toString("utf8")).slice(0, DEFAULT_MAX_STDERR_BYTES - this.stderrDiagnostic.length);
       });
       child.once("error", (error) => {
+        untrackTree();
         if (!this.stopping) this.connection?.close(error);
       });
       const input = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
@@ -564,6 +648,9 @@ export class AcpWorker {
           }, force ? 500 : 3_000);
           timer.unref?.();
         });
+      }
+      if (child && (child.exitCode !== null || child.signalCode !== null) && liveTrees.delete(child)) {
+        syncOwnerSignalHandlers();
       }
       this.stateValue = "closed";
       debug("official Antigravity worker stopped", { force });
