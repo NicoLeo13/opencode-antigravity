@@ -7,3 +7,6 @@ coverage/
 *.key
 .DS_Store
 *.log
+
+# Harness artifacts, not part of the plugin.
+skills/
