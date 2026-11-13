@@ -9,6 +9,18 @@ describe("ACP to Anthropic translation", () => {
       cache_read_input_tokens: 2,
       output_tokens_details: { thinking_tokens: 3 },
     });
+    expect(usageFromAcp({ inputTokens: 1200, outputTokens: 180, thoughtTokens: 120, cachedReadTokens: 24_000, totalTokens: 25_380 })).toEqual({
+      input_tokens: 1200,
+      output_tokens: 180,
+      cache_read_input_tokens: 24_000,
+      output_tokens_details: { thinking_tokens: 120 },
+    });
+    expect(usageFromAcp({ inputTokens: 1200, outputTokens: 60, thoughtTokens: 120, cachedReadTokens: 24_000, totalTokens: 25_380 })).toEqual({
+      input_tokens: 1200,
+      output_tokens: 180,
+      cache_read_input_tokens: 24_000,
+      output_tokens_details: { thinking_tokens: 120 },
+    });
   });
 
   test("shows a tool once as running and omits successful completion", () => {

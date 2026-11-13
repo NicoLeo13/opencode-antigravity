@@ -140,6 +140,23 @@ function profile(tools: HostTool[], settings: SessionSettings): string {
   return canonical({ tools: tools.map(({ name, input_schema }) => ({ name, input_schema })).sort((a, b) => a.name.localeCompare(b.name)), model: settings.model, effort: settings.effort });
 }
 
+function normalizeHostToolArgs(tool: HostTool, rawArgs: Record<string, unknown>): Record<string, unknown> {
+  const properties = tool.input_schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return rawArgs;
+  const schemaProps = properties as Record<string, unknown>;
+  if ("path" in schemaProps && rawArgs.path === undefined) {
+    if (!("filePath" in schemaProps) && "filePath" in rawArgs && rawArgs.filePath !== undefined) {
+      const { filePath, ...rest } = rawArgs;
+      return { ...rest, path: filePath };
+    }
+    if (!("file_path" in schemaProps) && "file_path" in rawArgs && rawArgs.file_path !== undefined) {
+      const { file_path, ...rest } = rawArgs;
+      return { ...rest, path: file_path };
+    }
+  }
+  return rawArgs;
+}
+
 export class HostBridge {
   readonly token = randomBytes(32).toString("hex");
   tools: HostTool[] = [];
@@ -176,12 +193,14 @@ export class HostBridge {
   get evictable(): boolean { return !this.active && !this.consuming && !this.waiting; }
 
   async call(name: string, args: unknown): Promise<ToolResult> {
-    if (!this.active || this.closed || !this.tools.some((tool) => tool.name === name)) throw new AgyError("unsupported", "Tool is unavailable in this OpenCode turn");
+    const tool = this.tools.find((candidate) => candidate.name === name);
+    if (!this.active || this.closed || !tool) throw new AgyError("unsupported", "Tool is unavailable in this OpenCode turn");
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new AgyError("invalid_request", "Tool arguments must be an object");
     if (this.pending.size >= 128) throw new AgyBusyError("Too many pending OpenCode tool calls");
-    const call: HostCall = { type: "tool_use", id: `toolu_${randomUUID().replaceAll("-", "")}`, name, input: args as Record<string, unknown> };
+    const normalizedArgs = normalizeHostToolArgs(tool, args as Record<string, unknown>);
+    const call: HostCall = { type: "tool_use", id: `toolu_${randomUUID().replaceAll("-", "")}`, name, input: normalizedArgs };
     const record = await sessionStore.get(this.key);
-    await sessionStore.saveToolCall(this.key, call.id, { call, hostSessionID: this.sessionID, argumentsDigest: createHash("sha256").update(canonical(args)).digest("hex"), epoch: record?.conversation?.epoch, requestId: this.turn?.identity?.value ?? this.turn?.requestId, profile: this.signature, emitted: true });
+    await sessionStore.saveToolCall(this.key, call.id, { call, hostSessionID: this.sessionID, argumentsDigest: createHash("sha256").update(canonical(normalizedArgs)).digest("hex"), epoch: record?.conversation?.epoch, requestId: this.turn?.identity?.value ?? this.turn?.requestId, profile: this.signature, emitted: true });
     if (this.closed) throw new AgyAbortError();
     this.callCount++;
     const requestID = this.turn?.identity?.value ?? this.turn?.requestId;

@@ -512,3 +512,131 @@ test("clearing instructions during a parked tool turn rebuilds without old instr
   expect(logged.text).not.toContain("<instruction>");
   expect((await sessionStore.toolCall(key, call.id))?.resultDigest).toBeString();
 });
+
+test("normalizes filePath/file_path to path when schema declares only path and preserves parked occupancy", async () => {
+  const { sessionPool } = await import("../src/session-pool.js");
+  const { HostBridge, handleHostMcp } = await import("../src/host-tools.js");
+  const pathTools = [
+    {
+      name: "read",
+      description: "Read file",
+      input_schema: {
+        type: "object",
+        properties: { path: { type: "string" }, offset: { type: "number" } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "explicit_filepath",
+      description: "Uses filePath explicitly",
+      input_schema: {
+        type: "object",
+        properties: { filePath: { type: "string" } },
+        required: ["filePath"],
+        additionalProperties: false,
+      },
+    },
+  ];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: handleHostMcp });
+  let parkedPromptCount = 0;
+  const fakeSessions = {
+    async *turn(turnReq: any) {
+      parkedPromptCount++;
+      const mcpUrl = turnReq.settings.mcpServers[0].url;
+      const rpc = (method: string, params: unknown) =>
+        fetch(mcpUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: `${parkedPromptCount}-${method}-${Math.random()}`, method, params }),
+        }).then((r) => r.json());
+      if (parkedPromptCount === 1) {
+        if (turnReq.responseCursor) {
+          turnReq.responseCursor.contextOccupancy = { used: 321, observedAt: Date.now() };
+        }
+        await rpc("initialize", { protocolVersion: "2025-03-26" });
+        const [readResult, snakeResult, explicitResult, untouchedResult] = await Promise.all([
+          rpc("tools/call", { name: "read", arguments: { filePath: "src/app.ts", offset: 5 } }),
+          rpc("tools/call", { name: "read", arguments: { file_path: "src/snake.ts" } }),
+          rpc("tools/call", { name: "explicit_filepath", arguments: { filePath: "keep.ts" } }),
+          rpc("tools/call", { name: "read", arguments: { path: "src/real.ts", filePath: "ignored.ts" } }),
+        ]);
+        yield {
+          event: "update" as const,
+          sessionId: "fake-norm",
+          update: {
+            sessionUpdate: "agent_message_chunk" as const,
+            content: { type: "text" as const, text: JSON.stringify([readResult.result, snakeResult.result, explicitResult.result, untouchedResult.result]) },
+          },
+        };
+        yield { event: "result" as const, sessionId: "fake-norm", result: { stopReason: "end_turn" as const } };
+      }
+    },
+    async forgetWorker() {},
+  };
+  const customBridge = new HostBridge("normalize-bridge-key", "normalize-host", directory, { sessions: fakeSessions as unknown as typeof sessionPool });
+  const origSaveReceipt = sessionStore.saveReceipt.bind(sessionStore);
+  let parkedArrivals = 0;
+  let releaseBatch!: () => void;
+  const batchBarrier = new Promise<void>((resolve) => { releaseBatch = resolve; });
+  const receiptSpy = spyOn(sessionStore, "saveReceipt").mockImplementation(async (...args) => {
+    await origSaveReceipt(...args);
+    if (args[0] === "normalize-bridge-key" && args[2].state === "parked") {
+      if (++parkedArrivals === 4) releaseBatch();
+      await batchBarrier;
+    }
+  });
+  try {
+    const initialMessages: any[] = [{ role: "user", content: "read a file" }];
+    const iter = customBridge.request({
+      messages: initialMessages,
+      tools: pathTools,
+      settings: { cwd: directory, model: "gemini-3.8-flash" },
+      baseURL: `http://127.0.0.1:${server.port}`,
+      requestId: "normalize-req-1",
+    })[Symbol.asyncIterator]();
+    let parkedEvent: any;
+    while (true) {
+      const next = await iter.next();
+      if (next.done) break;
+      if (next.value.event === "host_tools") {
+        parkedEvent = next.value;
+      }
+    }
+    receiptSpy.mockRestore();
+    expect(parkedEvent).toBeDefined();
+    expect(parkedEvent.contextOccupancy).toEqual({ used: 321 });
+    expect(parkedEvent.calls).toHaveLength(4);
+    const actualCalls = parkedEvent.calls.map((c: any) => ({ name: c.name, input: c.input }));
+    expect(actualCalls).toContainEqual({ name: "read", input: { path: "src/app.ts", offset: 5 } });
+    expect(actualCalls).toContainEqual({ name: "read", input: { path: "src/snake.ts" } });
+    expect(actualCalls).toContainEqual({ name: "explicit_filepath", input: { filePath: "keep.ts" } });
+    expect(actualCalls).toContainEqual({ name: "read", input: { path: "src/real.ts", filePath: "ignored.ts" } });
+
+    // Resuming with the normalized call input must reconcile cleanly against saved toolCall.
+    const continuationMessages = [
+      ...initialMessages,
+      { role: "assistant", content: parkedEvent.calls },
+      {
+        role: "user",
+        content: parkedEvent.calls.map((c: any, idx: number) => result(c.id, `RES_${idx}`)),
+      },
+    ];
+    const finalEvents: any[] = [];
+    for await (const event of customBridge.request({
+      messages: continuationMessages,
+      tools: pathTools,
+      settings: { cwd: directory, model: "gemini-3.8-flash" },
+      baseURL: `http://127.0.0.1:${server.port}`,
+    })) {
+      finalEvents.push(event);
+    }
+    expect(finalEvents.some((e) => e.event === "result")).toBe(true);
+    expect(JSON.stringify(finalEvents)).toContain("RES_0");
+  } finally {
+    releaseBatch();
+    receiptSpy.mockRestore();
+    await customBridge.close();
+    server.stop(true);
+  }
+});

@@ -44,14 +44,61 @@ export function usageFromAcp(usage: unknown): AnthropicUsage | undefined {
   const thinking = nonNegativeInteger(value.thoughtTokens ?? value.thinking_tokens ?? value.reasoning_tokens);
   const cached = nonNegativeInteger(value.cachedReadTokens ?? value.cacheReadTokens ?? value.cache_read_tokens ?? value.cachedInputTokens);
   const created = nonNegativeInteger(value.cachedWriteTokens ?? value.cacheCreationTokens ?? value.cache_creation_input_tokens);
-  if (input !== undefined && (cached ?? 0) + (created ?? 0) > input) return undefined;
+  const total = nonNegativeInteger(value.totalTokens ?? value.total_tokens);
   if (input === undefined && output === undefined && cached === undefined && created === undefined && thinking === undefined) return undefined;
-  // ACP totals are inclusive. Anthropic input_tokens excludes cache reads and
-  // writes; otherwise the host encoder would count those tokens twice. Missing
-  // totals remain required wire placeholders, not inferred measurements.
+
+  const cacheRead = cached ?? 0;
+  const cacheWrite = created ?? 0;
+  const cacheTotal = cacheRead + cacheWrite;
+  const rawInput = input ?? 0;
+  const rawOutput = output ?? 0;
+  const thoughts = thinking ?? 0;
+  const outputIncludesThoughts = thinking === undefined || rawOutput >= thoughts;
+  let resolvedInput: number | undefined;
+  let resolvedOutput: number | undefined;
+
+  if (total !== undefined && input !== undefined) {
+    const candidates: Array<{ input: number; output: number }> = [];
+    // 1. ACP 1.5.0+: input excludes cache counters; output includes thoughtTokens.
+    if (outputIncludesThoughts) {
+      candidates.push({ input: rawInput, output: rawOutput });
+    }
+    // 2. Legacy ACP (e.g. 1.4.3): input includes cacheRead (+ optional cacheWrite); output excludes thoughts.
+    if (rawInput >= cacheRead) {
+      if (cacheWrite > 0 && rawInput >= cacheTotal) {
+        candidates.push({ input: rawInput - cacheTotal, output: rawOutput + thoughts });
+      }
+      candidates.push({ input: rawInput - cacheRead, output: rawOutput + thoughts });
+    }
+    // 3. Legacy gross input + inclusive output.
+    if (outputIncludesThoughts && rawInput >= cacheRead) {
+      if (cacheWrite > 0 && rawInput >= cacheTotal) {
+        candidates.push({ input: rawInput - cacheTotal, output: rawOutput });
+      }
+      candidates.push({ input: rawInput - cacheRead, output: rawOutput });
+    }
+    // 4. Net input + exclusive output.
+    if (thoughts > 0) {
+      candidates.push({ input: rawInput, output: rawOutput + thoughts });
+    }
+    const matched = candidates.find((candidate) => candidate.input + candidate.output + cacheTotal === total);
+    if (matched) {
+      resolvedInput = matched.input;
+      resolvedOutput = matched.output;
+    }
+  }
+
+  if (resolvedInput === undefined) {
+    // Legacy ACP reports gross input including cache counters; reject malformed
+    // omitted-total payloads where cache counters exceed input.
+    if (input !== undefined && cacheTotal > input) return undefined;
+    resolvedInput = input === undefined ? 0 : Math.max(0, input - cacheTotal);
+    resolvedOutput = rawOutput;
+  }
+
   return {
-    input_tokens: input === undefined ? 0 : Math.max(0, input - (cached ?? 0) - (created ?? 0)),
-    output_tokens: output ?? 0,
+    input_tokens: resolvedInput,
+    output_tokens: resolvedOutput ?? 0,
     ...(cached !== undefined ? { cache_read_input_tokens: cached } : {}),
     ...(created !== undefined ? { cache_creation_input_tokens: created } : {}),
     ...(thinking !== undefined ? { output_tokens_details: { thinking_tokens: thinking } } : {}),

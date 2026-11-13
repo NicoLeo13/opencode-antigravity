@@ -18,6 +18,7 @@ test("retry durations and timestamps preserve provider hints", () => {
 test("official ACP cached accounting is not occupancy", () => {
   expect(usageFromAcp({ used: 30_000, size: 100_000 })).toBeUndefined();
   expect(usageFromAcp({ inputTokens: 10, outputTokens: 2, cachedReadTokens: 3, cachedWriteTokens: 4 })).toEqual({ input_tokens: 3, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 });
+  expect(usageFromAcp({ inputTokens: 3, outputTokens: 2, cachedReadTokens: 4, cachedWriteTokens: 5, totalTokens: 14 })).toEqual({ input_tokens: 3, output_tokens: 2, cache_read_input_tokens: 4, cache_creation_input_tokens: 5 });
   expect(usageFromAcp({ totalTokens: 100 })).toBeUndefined();
   expect(usageFromAcp({ inputTokens: 0, outputTokens: 0 })).toEqual({ input_tokens: 0, output_tokens: 0 });
   expect(usageFromAcp({ inputTokens: 3, cachedReadTokens: 4 })).toBeUndefined();
