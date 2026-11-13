@@ -5,6 +5,7 @@ export const PLUGIN_VERSION = "0.6.4";
 export const HOST_MCP_SERVER_NAME = "external_tool";
 /** A deliberately non-secret value used by the loopback adapter. */
 export const LOCAL_API_KEY = "opencode-antigravity-local";
+export const DEFAULT_PROXY_PORT = 42123;
 
 export const DEFAULT_PRINT_TIMEOUT_MS = 5 * 60_000;
 export const DEFAULT_TURN_STALL_TIMEOUT_MS = 10 * 60_000;

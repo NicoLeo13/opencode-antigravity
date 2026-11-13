@@ -37,7 +37,11 @@ import {
   replay,
   type AnthropicUsage,
 } from "./translate.js";
-import { getQuotaSnapshot } from "./quota.js";
+import { getQuotaSnapshot, quotaManager } from "./quota.js";
+import { reconcileQuotaSettings } from "./quota-settings.js";
+import { isAddressInUse, preferredProxyPort, probeLoopbackHealth, sharedEndpointPort } from "./proxy-port.js";
+
+type ProxyServer = ReturnType<typeof Bun.serve>;
 
 export type AnthropicMessageRequest = {
   model?: unknown;
@@ -74,6 +78,11 @@ let server: ReturnType<typeof Bun.serve> | null = null;
 let proxyPort: number | null = null;
 let runtime: RuntimeState | null = null;
 let startPromise: Promise<number> | null = null;
+/** The quota-only listener that takes the shared port over when it frees up. */
+let sharedQuotaServer: ReturnType<typeof Bun.serve> | null = null;
+let sharedQuotaTimer: ReturnType<typeof setInterval> | null = null;
+/** How often a fallback instance checks whether the shared port freed up. */
+const SHARED_QUOTA_WATCH_INTERVAL_MS = 30_000;
 let warnedTemperature = false;
 const workspaceRoots = new Set<string>();
 const catalogListeners = new Set<() => void>();
@@ -83,9 +92,33 @@ function localModelCatalogChange(listener: () => void): () => void {
   return () => { catalogListeners.delete(listener); };
 }
 
-function requestedPort(): number {
-  const value = Number(process.env.OPENCODE_ANTIGRAVITY_PROXY_PORT);
-  return Number.isInteger(value) && value >= 0 && value < 65_536 ? value : 0;
+/**
+ * Binds the loopback proxy.
+ *
+ * The preferred port is shared by every OpenCode instance on the machine, so
+ * a second instance falls back to an ephemeral port instead of failing to
+ * load. A failed plugin load takes the whole provider down with it, so a
+ * busy port must never throw here.
+ */
+function bindProxyServer(preferred: number): { server: ProxyServer; port: number; shared: boolean } {
+  const serve = (port: number): ProxyServer => Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: 0, fetch: handleRequest });
+  if (preferred === 0) {
+    const server = serve(0);
+    return { server, port: server.port ?? 0, shared: false };
+  }
+  try {
+    const server = serve(preferred);
+    return { server, port: server.port ?? preferred, shared: true };
+  } catch (error) {
+    if (!isAddressInUse(error)) throw error;
+    const server = serve(0);
+    warn("The preferred Antigravity proxy port is in use; this instance uses an ephemeral port", {
+      port: preferred,
+      fallbackPort: server.port ?? 0,
+      reason: "port_in_use",
+    });
+    return { server, port: server.port ?? 0, shared: false };
+  }
 }
 
 function readHeader(request: Request, name: string): string | undefined {
@@ -117,7 +150,13 @@ function localAuthorizationIsValid(request: Request): boolean {
   const bearer = request.headers.get("authorization")?.trim();
   const apiKey = request.headers.get("x-api-key")?.trim();
   const token = readHeader(request, REQUEST_TOKEN_HEADER);
-  return bearer === `Bearer ${LOCAL_API_KEY}` || apiKey === LOCAL_API_KEY || token === LOCAL_API_KEY;
+  const customKey = process.env.OPENCODE_ANTIGRAVITY_API_KEY?.trim();
+  return (
+    bearer === `Bearer ${LOCAL_API_KEY}` ||
+    apiKey === LOCAL_API_KEY ||
+    token === LOCAL_API_KEY ||
+    (Boolean(customKey) && (bearer === `Bearer ${customKey}` || apiKey === customKey || token === customKey))
+  );
 }
 
 async function readJson(request: Request): Promise<AnthropicMessageRequest> {
@@ -469,7 +508,15 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
 async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname.startsWith("/mcp/")) return handleHostMcp(request);
-  const protectedRoute = (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models" || url.pathname === "/v1/usage" || url.pathname === "/usage" || url.pathname === "/v1/quota" || url.pathname === "/quota")) || (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages"));
+  const protectedRoute =
+    (request.method === "GET" &&
+      (url.pathname === "/v1/models" ||
+        url.pathname === "/models" ||
+        url.pathname === "/v1/usage" ||
+        url.pathname === "/usage" ||
+        url.pathname === "/v1/quota" ||
+        url.pathname === "/quota")) ||
+    (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages"));
   if (protectedRoute && !localAuthorizationIsValid(request)) return errorResponse(new AgyError("auth", "Invalid local proxy API key", { code: "agy_local_key" }));
   if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
     const ready = Boolean(runtime && runtime.catalog.source !== "empty");
@@ -498,6 +545,66 @@ async function handleRequest(request: Request): Promise<Response> {
   return new Response("Not Found", { status: 404 });
 }
 
+/**
+ * The port the shared quota endpoint names.
+ *
+ * The endpoint is a fixed loopback address, so every instance writes the same
+ * URL and the file never fights over it. Only the instance that owns the port
+ * can serve it; when a foreign application holds the port, the endpoint points
+ * at this instance instead so the quota stays readable.
+ */
+async function resolveQuotaEndpointPort(preferred: number, shared: boolean): Promise<number | null> {
+  const sharedPort = sharedEndpointPort(preferred);
+  if (sharedPort === null) return null;
+  if (shared) return sharedPort;
+  if (await probeLoopbackHealth(sharedPort)) return sharedPort;
+  warn("Another application holds the Antigravity shared quota port; the quota endpoint points at this instance", {
+    port: sharedPort,
+    localPort: proxyPort,
+    reason: "port_in_use",
+  });
+  return proxyPort;
+}
+
+/** Serves the quota endpoint alone, for an instance that owns no model traffic. */
+async function handleSharedQuotaRequest(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
+    return Response.json({ ok: true, provider: "antigravity", proxy: "loopback", role: "quota-endpoint" });
+  }
+  if (request.method === "GET" && (url.pathname === "/quota" || url.pathname === "/v1/quota")) {
+    if (!localAuthorizationIsValid(request)) return errorResponse(new AgyError("auth", "Invalid local proxy API key", { code: "agy_local_key" }));
+    try {
+      return Response.json(await getQuotaSnapshot(request.signal));
+    } catch (error) {
+      logError("quota request failed", { kind: error instanceof AgyError ? error.kind : "internal" });
+      return errorResponse(error);
+    }
+  }
+  return new Response("Not Found", { status: 404 });
+}
+
+/**
+ * Keeps the shared quota endpoint alive when the instance that owned it goes
+ * away: the first instance that finds the port free takes it over, so the
+ * shared URL keeps answering without a restart.
+ */
+function watchSharedQuotaEndpoint(port: number): void {
+  if (sharedQuotaTimer || sharedQuotaServer) return;
+  sharedQuotaTimer = setInterval(() => {
+    if (sharedQuotaServer) return;
+    try {
+      sharedQuotaServer = Bun.serve({ hostname: "127.0.0.1", port, idleTimeout: 0, fetch: handleSharedQuotaRequest });
+      info("Antigravity shared quota endpoint listening", { port });
+      quotaManager.start();
+      if (sharedQuotaTimer) { clearInterval(sharedQuotaTimer); sharedQuotaTimer = null; }
+    } catch (error) {
+      if (!isAddressInUse(error)) warn("Could not take over the Antigravity shared quota port", { port, cause: error });
+    }
+  }, SHARED_QUOTA_WATCH_INTERVAL_MS);
+  sharedQuotaTimer.unref?.();
+}
+
 async function startProxyInternal(directory: string): Promise<number> {
   if (server && proxyPort) return proxyPort;
   sessionPool.open();
@@ -510,12 +617,19 @@ async function startProxyInternal(directory: string): Promise<number> {
     },
   });
   runtime = { directory, manager, get catalog() { return manager.catalog; } };
-  const bound = Bun.serve({ hostname: "127.0.0.1", port: requestedPort(), idleTimeout: 0, fetch: handleRequest });
-  server = bound;
-  proxyPort = bound.port ?? null;
+  const preferred = preferredProxyPort();
+  const bound = bindProxyServer(preferred);
+  server = bound.server;
+  proxyPort = bound.port || null;
   if (!proxyPort) throw new AgyError("internal", "The loopback Antigravity proxy did not receive a port", { code: "agy_proxy_no_port" });
   await manager.start();
-  info("Antigravity loopback proxy listening", { port: proxyPort, models: manager.catalog.models.length, ready: manager.catalog.source !== "empty" });
+  const endpointPort = await resolveQuotaEndpointPort(preferred, bound.shared);
+  if (endpointPort) void reconcileQuotaSettings(endpointPort).catch(() => undefined);
+  // Only the instance that serves the shared quota endpoint keeps a warm
+  // snapshot; the others answer from their own request when it is asked.
+  if (endpointPort && endpointPort === proxyPort) quotaManager.start();
+  if (!bound.shared && sharedEndpointPort(preferred) !== null) watchSharedQuotaEndpoint(sharedEndpointPort(preferred)!);
+  info("Antigravity loopback proxy listening", { port: proxyPort, shared: bound.shared, models: manager.catalog.models.length, ready: manager.catalog.source !== "empty" });
   return proxyPort;
 }
 
@@ -530,6 +644,9 @@ async function releaseProxy(directory?: string): Promise<void> {
   if (directory) workspaceRoots.delete(resolvePath(directory)); else workspaceRoots.clear();
   if (workspaceRoots.size > 0) return;
   await closeHostBridges();
+  if (sharedQuotaTimer) { clearInterval(sharedQuotaTimer); sharedQuotaTimer = null; }
+  if (sharedQuotaServer) { sharedQuotaServer.stop(true); sharedQuotaServer = null; }
+  await quotaManager.stop();
   if (server) { server.stop(true); server = null; proxyPort = null; }
   const manager = runtime?.manager;
   runtime = null;
